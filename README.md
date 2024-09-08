@@ -12,7 +12,7 @@ Any type of calculation that includes both arithmetical and non-arithmetical ste
 # major branch of computer science<br>
 
 ## Software engineering<br>
-< img src="https://github.com/user-attachments/assets/aace0b65-537f-42e4-b5d3-63192e39a606" alt="Java" width="40" height="40"/><br>
+<img src="https://github.com/user-attachments/assets/aace0b65-537f-42e4-b5d3-63192e39a606" alt="Java" width="40" height="40"/><br>
 Software engineering is a branch of computer science that includes developing and manufacturing computer systems software. Making an application is one of the main tasks of this field of study. Software engineers and computer programmers both develop software programs needed by computers.
 
 ## data science<br>
