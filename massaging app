@@ -1,0 +1,550 @@
+import logging
+import os
+import sys
+import asyncio
+import signal
+import base64
+import hashlib
+import hmac
+import urllib.parse
+from optparse import OptionParser
+
+import toml
+import slixmpp
+from slixmpp import Message
+from slixmpp.componentxmpp import ComponentXMPP
+from slixmpp.exceptions import XMPPError, IqError
+from slixmpp.xmlstream import register_stanza_plugin
+from slixmpp.jid import JID
+from nextcord import Status, Embed
+import requests
+
+from xmpp_discord_bridge.slixmpp.oob import OOBData
+from xmpp_discord_bridge.avatar import AvatarManager
+from xmpp_discord_bridge.discord import DiscordClient
+from xmpp_discord_bridge.helpers import discord_status_to_xmpp_show
+
+# TODO: Move into separate file
+# TODO: Add an option that allows a real user to join the MUC to replace a virtual one
+class BridgeComponent(ComponentXMPP):
+    def __init__(self, jid, secret, server, port, token, config):
+        ComponentXMPP.__init__(self, jid, secret, server, port)
+
+        self._config = config
+        self._logger = logging.getLogger("xmpp.bridge")
+        self._domain = jid
+        self._bot_nick = "Bot"
+        self._bot_jid_bare = JID("bot@" + jid)
+        self._bot_jid_full = JID("bot@" + jid + "/" + self._bot_nick)
+
+        self._token = token
+        self._discord = None
+
+        self._avatars = AvatarManager(self, config)
+        
+        # State tracking
+        self._virtual_muc_users = {} # MUC -> [Resources]
+        self._virtual_muc_nicks = {} # MUC -> User ID -> Nick
+        self._real_muc_users = {} # MUC -> [Resources]
+        self._guild_map = {} # Guild ID -> Channel ID -> MUC
+        self._muc_map = {} # MUC -> (Guild ID, Channel ID)
+        self._mucs = [] # List of known MUCs
+        self._webhooks = {} # MUC -> Webhook URL
+
+        # Settings
+        self._proxy_url_template = self._config["general"].get("proxy_discord_urls_to", "")
+        self._proxy_hmac_secret = self._config["general"].get("hmac_secret", "")
+        self._relay_xmpp_avatars = self._config["general"].get("relay_xmpp_avatars", False)
+        self._dont_ignore_offline = self._config["general"].get("dont_ignore_offline", True)
+        self._reactions_compat = self._config["general"].get("reactions_compat", True)
+        self._muc_mention_compat = self._config["general"].get("muc_mention_compat", True)
+        self._remove_url_on_embed = self._config["general"].get("remove_url_on_embed", False)
+
+        register_stanza_plugin(Message, OOBData)
+        
+        self.add_event_handler("session_start", self.on_session_start)
+        self.add_event_handler("groupchat_message", self.on_groupchat_message)
+        self.add_event_handler("groupchat_presence", self.on_groupchat_presence)
+
+    async def send_oob_data(self, url, muc, member):
+        """
+        Send a message using XEP-0066 OOB data
+        """
+        if self._proxy_url_template:
+            hmac_str = urllib.parse.quote(base64.b64encode(hmac.digest(self._proxy_hmac_secret.encode(),
+                                                                   url.encode(),
+                                                                   "sha256")), safe="")
+            proxy = self._proxy_url_template.replace("<hmac>", hmac_str).replace("<url>", urllib.parse.quote(url, safe=""))
+            url = proxy
+
+        self._logger.debug("OOB URL: %s", url)
+        msg = self.make_message(muc,
+                                mbody=url,
+                                mtype="groupchat",
+                                mfrom=self.spoof_member_jid(member.id))
+        msg["oob"]["url"] = url
+        msg.send()
+        
+    def spoof_member_jid(self, id_):
+        """
+        Return a full JID that we use for the puppets
+        """
+        return JID(str(id_) + "@" + self._domain + "/discord")
+
+    async def on_shutdown_signal(self):
+        """
+        Receiving SIGINT or SIGTERM means we need to pack up and shut down
+        """
+        await self._discord.close()
+
+        # Remove all virtual users
+        # NOTE: We cannot use leave_muc as this would also remove the MUC
+        #       from slixmpp's internal tracking, which would probably break
+        #       later leaves
+        for muc in self._mucs:
+            for uid in self._virtual_muc_nicks[muc]:
+                nick = self._virtual_muc_nicks[muc][uid]
+                self.send_presence(pshow='unavailable',
+                                   pto="%s/%s" % (muc, nick),
+                                   pfrom=self.spoof_member_jid(uid))
+
+            # Remove the Bot user
+            self.send_presence(pshow='unavailable',
+                               pto="%s/%s" % (muc, "Bot"),
+                               pfrom=self._bot_jid_full)
+
+        # Disconnect and close
+        await self.disconnect()
+    
+    async def on_discord_ready(self):
+        asyncio.get_event_loop().add_signal_handler(signal.SIGINT,
+                                                      lambda: asyncio.create_task(self.on_shutdown_signal()))
+        asyncio.get_event_loop().add_signal_handler(signal.SIGTERM,
+                                                      lambda: asyncio.create_task(self.on_shutdown_signal()))
+
+        for ch in self._config["discord"]["channels"]:
+            muc = ch["muc"]
+            channel = ch["channel"]
+            guild = ch["guild"]
+            dchannel = self._discord.get_channel(channel)
+            
+            # Initialise state tracking
+            self._muc_map[muc] = (guild, channel)
+            self._virtual_muc_users[muc] = []
+            self._virtual_muc_nicks[muc] = {}
+            for member in dchannel.members:
+                if member.status == Status.offline and not self._dont_ignore_offline:
+                    continue
+                
+                self._virtual_muc_users[muc].append(member.display_name)
+                self._virtual_muc_nicks[muc][member.id] = member.display_name
+            self._real_muc_users[muc] = []
+            self._mucs.append(muc)
+            if not guild in self._guild_map:
+                self._guild_map[guild] = {
+                    channel: muc
+                }
+            else:
+                self._guild_map[guild][channel] = muc
+
+            self._logger.debug("Joining %s", muc)
+            self.plugin["xep_0045"].join_muc(muc,
+                                             nick=self._bot_nick,
+                                             pfrom=self._bot_jid_full)
+
+            # Set the subject
+            room_config = await self.plugin["xep_0045"].get_room_config(muc,
+                                                                        ifrom=self._bot_jid_full)
+            room_config_fields = room_config.get_values()
+            should_update = False
+            description = room_config_fields.get("muc#roomconfig_roomdesc", None)
+            name = room_config_fields.get("muc#roomconfig_roomname", None)
+            room_config.reply()
+            if not description or description != (dchannel.topic or ""):
+                should_update = True
+                room_config.set_values({
+                    "muc#roomconfig_roomdesc": dchannel.topic or ""
+                })
+                self.plugin["xep_0045"].set_subject(muc,
+                                                    dchannel.topic or "",
+                                                    mfrom=self._bot_jid_full)
+
+            if not name or name != dchannel.name:
+                should_update = True
+                room_config.set_values({
+                    "muc#roomconfig_roomname": dchannel.name
+                })
+
+            # NOTE: To prevent messages in clients that the roomconfig changed at every restart,
+            #       check first if we really have to change stuff
+            if should_update:
+                await self.plugin["xep_0045"].set_room_config(muc,
+                                                              room_config,
+                                                              ifrom=self._bot_jid_full)
+
+            # TODO: Is this working?
+            # Mirror the guild's icon
+            icon_url = dchannel.guild.icon.url
+            if icon_url:
+                req = requests.get(icon_url)
+
+                vcard = self.plugin["xep_0054"].make_vcard()
+                vcard["PHOTO"]["TYPE"] = "image/png"
+                vcard["PHOTO"]["BINVAL"] = base64.b64encode(req.content)
+                # TODO: Replace with provided API
+                self.send_raw("""
+<iq type="set" from="{}" to="{}">
+    <vCard xmlns="vcard-temp">
+{}
+    </vCard>
+</iq>
+                """.format(self._bot_jid_full,
+                           muc,
+                           str(vcard)))
+            
+            # Aquire a webhook
+            wh = None
+            for webhook in await dchannel.webhooks():
+                if webhook.name == "discord-xmpp-bridge":
+                    if not webhook.is_authenticated():
+                        _logger.info("Webhook for %s has no token. Deleting and recreating" % muc)
+                        await webhook.delete(reason="Webhook has no token. Will recreate")
+                    else:
+                        wh = webhook
+                    break
+            if not wh:
+                wh = await dchannel.create_webhook(name="discord-xmpp-bridge",
+                                                   reason="Bridging Discord and XMPP")
+            self._webhooks[muc] = wh
+
+            # Make sure our virtual users can join
+            affiliation_list = await self.plugin["xep_0045"].get_affiliation_list(muc,
+                                                                                  "member",
+                                                                                  ifrom=self._bot_jid_full)
+            for member in dchannel.members:
+                bare_member_jid = self.spoof_member_jid(member.id).bare
+                if not bare_member_jid in affiliation_list:
+                    await self.plugin["xep_0045"].set_affiliation(muc,
+                                                                  "member",
+                                                                  jid=bare_member_jid,
+                                                                  ifrom=self._bot_jid_full)
+                
+                self.virtual_user_join_muc(muc, member, update_state_tracking=False)
+
+            self._logger.info("%s is ready", muc)
+        self._logger.info("Bridge is ready")
+
+    async def on_groupchat_message(self, message):
+        muc = message["from"].bare
+        if not message["body"]:
+            return
+        if not message["from"].resource in self._real_muc_users[muc]:
+            return
+        # Prevent the message being reflected back into Discord
+        if not message["to"] == self._bot_jid_full:
+            return
+
+        content = message["body"]
+        embed = None
+
+        # Look for mentions and replace them
+        guild, channel = self._muc_map[muc]
+        for member in self._discord.get_guild(guild).get_channel(channel).members:
+            self._logger.debug("Checking %s", member.display_name)
+            if "@" + member.display_name in content:
+                self._logger.debug("Found mention for %s. Replaceing.",
+                                   member.display_name)
+                content = content.replace("@" + member.display_name,
+                                          member.mention)
+            
+        if message["oob"]["url"] and message["body"] == message["oob"]["url"]:
+            # TODO: Quick and dirty hack. Discord requires a webhook embed to have
+            #       a description
+            description = message["oob"]["url"].split("/")[-1]
+            embed = Embed(url=message["oob"]["url"], type="rich", description=description)
+            embed.set_image(url=message["oob"]["url"])
+
+            # I mean, this should always be true, but you never know
+            if content == message["oob"]["url"] and self._remove_url_on_embed:
+                # NOTE: To prevent the URL being visible in Discord, remove the content.
+                #       Makes it feel more native.
+                content = None
+
+        try:
+            await self._webhooks[muc].send(content=content,
+                                           username=message["from"].resource,
+                                           avatar_url=self._avatars.get_avatar_url(message["from"]),
+                                           embed=embed)
+        except Exception as err:
+            self._logger.error("Webhook execution failed: %s",
+                               err)
+
+    def virtual_user_update_presence(self, muc, uid, pshow, pstatus=None):
+        """
+        Change the status of a virtual MUC member.
+        NOTE: This assumes that the user is in the MUC
+        """
+        self.send_presence(pshow=pshow,
+                           pstatus=pstatus,
+                           pto="%s/%s" % (muc, self._virtual_muc_nicks[muc][uid]),
+                           pfrom=self.spoof_member_jid(uid))
+        
+    def virtual_user_join_muc(self, muc, member, update_state_tracking=False):
+        """
+        Makes the a puppet of member (@discord.Member) join the
+        MUC. Does nothing if the member is offline.
+
+        If update_state_tracking is True, then _virtual_muc_... gets updates.
+        """
+        if member.status == Status.offline and not self._dont_ignore_offline:
+            return
+
+        if update_state_tracking:
+            self._virtual_muc_users[muc].append(member.display_name)
+            self._virtual_muc_nicks[muc][member.id] = member.display_name
+
+        # Prevent offline users from getting an unavailable presence by
+        # accident
+        pshow = discord_status_to_xmpp_show(member.status)
+        pstatus = ""
+        if member.status == Status.offline:
+            pshow = "xa"
+
+            if self._dont_ignore_offline:
+                pstatus = "Offline"
+
+        self.plugin["xep_0045"].join_muc(muc,
+                                         nick=member.display_name,
+                                         pfrom=self.spoof_member_jid(member.id),
+                                         pshow=pshow,
+                                         pstatus=pstatus)
+        
+    async def on_discord_member_join(self, member):
+        guild = member.guild.id
+        if not guild in self._guild_map:
+            return
+
+        self._logger.debug("%s joined a known guild. Updating channels.",
+                           member.display_name)
+        for channel in self._guild_map[guild]:
+            muc = self._guild_map[guild][channel]
+            self.virtual_user_join_muc(muc, member, update_state_tracking=True)
+
+    async def on_discord_member_leave(self, member):
+        guild = member.guild.id
+        if not guild in self._guild_map:
+            return
+
+        self._logger.debug("%s left a known guild. Updating channels.",
+                           member.display_name)
+        for channel in self._guild_map[guild]:
+            muc = self._guild_map[member.guild.id][channel]
+            self._virtual_muc_users[muc].remove(member.display_name)
+            del self._virtual_muc_nicks[muc][member.id]
+
+            self.virtual_user_update_presence(muc, member.id, "unavailable")
+
+            
+    async def on_discord_member_update(self, before, after):
+        guild = after.guild.id
+        if not guild in self._guild_map:
+            return
+
+        # TODO: Handle nick changes
+        if before.status != after.status:
+            # Handle a status change
+            for channel in self._guild_map[guild]:
+                muc = self._guild_map[guild][channel]
+                if after.id not in self._virtual_muc_nicks[muc]:
+                    self._logger.debug("Got presence update from someone outside of the channel. Ignoring...")
+                    return
+
+                if after.status == Status.offline:
+                    if self._dont_ignore_offline:
+                        self.virtual_user_update_presence(muc,
+                                                          after.id,
+                                                          "xa",
+                                                          "Offline")
+                    else:
+                        self._logger.debug("%s went offline. Removing from state tracking.",
+                                           after.display_name)
+                        self.virtual_user_update_presence(muc,
+                                                          after.id,
+                                                          discord_status_to_xmpp_show(after.status))
+
+                        # Remove from all state tracking
+                        self._virtual_muc_users[muc].remove(after.display_name)
+                        del self._virtual_muc_nicks[muc][after.id]
+                elif before.status == Status.offline and after.status != Status.offline and not self._dont_ignore_offline:
+                    self.virtual_user_join_muc(muc, after, update_state_tracking=True)
+                else:
+                    self.virtual_user_update_presence(muc,
+                                                      after.id,
+                                                      discord_status_to_xmpp_show(after.status))
+
+
+    async def on_discord_channel_update(self, before, after):
+        if after.type != nextcord.ChannelType.text:
+            return
+
+        guild = after.guild.id
+        channel = after.id
+        if not guild in self._guild_map:
+            return
+        if not channel in self._guild_map[guild]:
+            return
+
+        # NOTE: We can only really handle description changes
+        muc = self._guild_map[guild][channel]
+        if before.topic != after.topic:
+            self._logger.debug("Channel %s changed the topic. Relaying.",
+                               after.name)
+            self.plugin["xep_0045"].set_subject(muc,
+                                                after.topic or "",
+                                                mfrom=self._bot_jid_full)
+
+    async def on_discord_reaction(self, guild, channel, emoji_str, msg, uid, kind):
+        """
+        Handle a Discord reaction.
+
+        reaction: discord.Reaction
+        user: discord.Member
+        kind: Either "add" or "remove"
+        """
+        if not self._reactions_compat:
+            self._logger.debug("Got a reaction but reactions_compat is turned off. Ignoring.")
+            return
+        if not guild in self._guild_map:
+            return
+        if not channel in self._guild_map[guild]:
+            return
+
+        muc = self._guild_map[guild][channel]
+
+        # TODO: Handle attachments
+        content = "> " + msg.clean_content.replace("\n", "\n> ") + "\n"
+        content += "+" if kind == "REACTION_ADD" else "-"
+        content += " " + emoji_str
+
+        self.send_message(mto=muc,
+                          mbody=content,
+                          mtype="groupchat",
+                          mfrom=self.spoof_member_jid(uid))
+
+    async def on_discord_message(self, msg):
+        guild, channel = msg.guild.id, msg.channel.id
+        if not (guild in self._guild_map and channel in self._guild_map[guild]):
+            return
+
+        muc = self._guild_map[guild][channel]
+        if msg.author.bot and msg.author.display_name in self._real_muc_users[muc]:
+            return
+
+        # TODO: Handle embeds
+        for attachment in msg.attachments:
+            await self.send_oob_data(attachment.url, muc, msg.author)
+
+        for sticker in msg.stickers:
+             await self.send_oob_data(sticker.url, muc, msg.author)
+            
+        if not msg.clean_content:
+            self._logger.debug("Message empty. Not relaying.")
+            return
+
+        mentions = [mention.display_name for mention in msg.mentions]
+        if self._muc_mention_compat and mentions: 
+            content = ", ".join(mentions) + ": " + msg.clean_content
+        else:
+            content = msg.clean_content
+        
+        self.send_message(mto=muc,
+                          mbody=content,
+                          mtype="groupchat",
+                          mfrom=self.spoof_member_jid(msg.author.id))
+
+    async def on_groupchat_presence(self, presence):
+        muc = presence["from"].bare
+        resource = presence["from"].resource
+
+        if not muc in self._mucs:
+            self._logger.warn("Received presence in unknown MUC %s", muc)
+            return
+        if resource in self._virtual_muc_users[muc]:
+            return
+        if not presence["to"] == self._bot_jid_full:
+            return
+        if resource == self._bot_nick:
+            return
+        
+        if presence["type"] == "unavailable":
+            try:
+                self._real_muc_users.remove(resource)
+            except:
+                self._logger.debug("Trying to remove %s from %s, but user is not in list. Skipping...",
+                                   muc,
+                                   resource)
+        else:
+            if self._relay_xmpp_avatars:
+                await self._avatars.aquire_avatar(presence["from"])
+            self._real_muc_users[muc].append(resource)
+        
+    async def on_session_start(self, event):
+        self._discord = DiscordClient(self, self._config)
+        asyncio.ensure_future(self._discord.start(self._token))
+
+def main():
+    parser = OptionParser()
+    parser.add_option(
+        "-d", "--debug", dest="debug", help="Enable debug logging", action="store_true"
+    )
+    parser.add_option(
+        "-c", "--config", dest="config", help="Config file path"
+    )
+
+    (options, args) = parser.parse_args()
+    verbosity = logging.DEBUG if options.debug else logging.INFO
+  
+    if options.config:
+        config = toml.load(options.config)
+    elif os.path.exists("./config.toml"):
+        config = toml.load("./config.toml")
+    elif os.path.exists("/etc/discord-xmpp-bridge/config.toml"):
+        config = toml.load("/etc/discord-xmpp-bridge/config.toml")
+    else:
+        raise Exception("config.toml not found")
+
+    general = config["general"]
+    secret = ""
+    if not "secret" in general:
+        if "secret_file" in general:
+            with open(general["secret_file"], "r") as f:
+                secret = f.read().replace("\n", "")
+        else:
+            raise Exception("No component secret specified")
+    else:
+        secret = general["secret"]
+
+    xmpp = BridgeComponent(general["jid"],
+                           secret,
+                           general["server"],
+                           general["port"],
+                           general["discord_token"],
+                           config)
+    for xep in [
+            "0030",
+            "0199",
+            "0045",
+            "0084",
+            "0153",
+            "0054",
+            "0060"
+    ]:
+        xmpp.register_plugin(f"xep_{xep}")
+
+    logging.basicConfig(stream=sys.stdout, level=verbosity)
+    
+    xmpp.connect()
+    xmpp.process(forever=False)
+        
+if __name__ == "__main__":
+    main()
